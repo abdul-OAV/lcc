@@ -9,6 +9,7 @@ const Connector = require('loopback-connector').Connector;
 const Promise = require('bluebird');
 const {
   CosmosClient,
+  PartitionKey,
 //   ConnectionPolicy,
 //   RetryOptions,
 } = require("@azure/cosmos");
@@ -167,6 +168,7 @@ CosmosDB.prototype.all = async function all(modelName, filter, options, callback
     const modelDefinition = this.getModelDefinition(modelName);
     try {
         const querySpec = buildQuerySpecForModel(this.queryOptions, modelDefinition, filter);
+        // debug(JSON.stringify(querySpec));
         // debug(querySpec);
         const container = this.client.database(this.databaseName).container(modelName);
         const output = await container.items.query(querySpec, { enableCrossPartitionQuery: this.enableCrossPartitionQuery }).fetchAll();
@@ -433,18 +435,27 @@ CosmosDB.prototype.update = async function update(model, where, data, options, c
 //     }
 // };
 
-CosmosDB.prototype.destroyAll = function destroyAll(model, where, options, callback) {
+CosmosDB.prototype.destroyAll = async function destroyAll(modelName, where, options, callback) {
+    // debug('destroyAll', where, options);
     const self = this;
-    const properties = ['c.id'];
+    const modelDefinition = this.getModelDefinition(modelName);
+    const partitionKey = this.partitionKey;
+    // const properties = ['c.id'];
     // if (this.partitionKey) {
     //     properties.push(`c.${this.partitionKey}`);
     // }
 
     try {
-        const querySpec = buildQuerySpecForModel(this.queryOptions, this.getModelDefinition(model), { where }, properties);
-        const iterator = this.client.database(this.databaseName).container(model)
-            .items.query(querySpec, { enableCrossPartitionQuery: this.enableCrossPartitionQuery });
-
+        // const querySpec = buildQuerySpecForModel(this.queryOptions, modelDefinition, { where }, properties);
+        const querySpec = buildQuerySpecForModel(this.queryOptions, modelDefinition, { where });
+        // debug(JSON.stringify(querySpec));
+        const container = this.client.database(this.databaseName).container(modelName);
+        const output = await container.items.query(querySpec, { enableCrossPartitionQuery: this.enableCrossPartitionQuery }).fetchAll();
+        // const iterator = this.client.database(this.databaseName).container(model)
+        //     .items.query(querySpec, { enableCrossPartitionQuery: this.enableCrossPartitionQuery });
+        const { resources: items, headers } = output;
+        // debug(output);
+        checkRequestCharge(headers, querySpec, this.queryOptions, modelName);
         let totalItems = 0;
         const failures = [];
 
@@ -456,42 +467,35 @@ CosmosDB.prototype.destroyAll = function destroyAll(model, where, options, callb
         // errors but rather execute the whole query iterator until end.
         // At the end, we report the ratio of how many operations succeeded
         // to caller. So that they can decide what to do.
-        const next = async () => {
-            // debug('next');
-            const { result: items, headers } = await iterator.fetchNext();
-            // Execute delete to next item in iteration.
-            if (items && items[0]) {
-                checkRequestCharge(headers, querySpec, this.queryOptions, this.collectionName);
-                const document = items[0];
-                ++totalItems;
-
-                return self.destroyOne(model, document, options, (error) => {
-                    if (error) {
-                        debug('Individual delete operator failed: %j', error);
-                        failures.push(document.id);
-                    }
-                    // debug(document);
-                    // Just move to next item, ignore possible errors.
-                    return next();
-                });
+        for (let index = 0; index < items.length; index++) {
+            const item = items[index];
+            // debug({item});
+            // debug(item.id, partitionKey);
+            try {
+                await container.item(String(item.id), String(item.id)).delete();
+            } catch (error) {
+                console.log(error);
+                failures.push({error, item});
             }
-            // Finish up the operation and report the caller.
-            const numberOfSuccesses = totalItems - failures.length;
-            debug('Batch destroy success rate is %j', numberOfSuccesses / totalItems);
-            return callback(null, {
-                count: numberOfSuccesses,
-                successRate: numberOfSuccesses / totalItems,
-                failures
-            });
-        };
-        return next();
+            ++totalItems;
+        }
+        // Finish up the operation and report the caller.
+        const numberOfSuccesses = totalItems - failures.length;
+        // debug({numberOfSuccesses, totalItems})
+        debug('Batch destroy success rate is %j', numberOfSuccesses / totalItems);
+        return callback(null, {
+            count: numberOfSuccesses,
+            successRate: numberOfSuccesses / totalItems,
+            failures
+        });
+
     } catch (error) {
         return callback(error);
     }
 };
 
 CosmosDB.prototype.destroyOne = async function destroyOne(model, document, options, callback) {
-    // debug('destroyOne', document, options);
+    debug('destroyOne', document, options);
     try {
         const partitionKey = this.partitionKey ? document[this.partitionKey] : undefined;
         await this.client.database(this.databaseName).container(model)
